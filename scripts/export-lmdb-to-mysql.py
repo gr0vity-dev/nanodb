@@ -150,7 +150,7 @@ try:
     if not os.path.isfile(filename):
         raise Exception("Database doesn't exist")
 
-    env = lmdb.open(filename, subdir=False, max_dbs=100, map_size=80000000000 )#10GB 
+    env = lmdb.open(filename, subdir=False, max_dbs=100 )
     num_cores = multiprocessing.cpu_count()     
 
     # Accounts table
@@ -158,7 +158,7 @@ try:
         print("Importing Accounts")
         accounts_db = env.open_db("accounts".encode())
         confirmation_db = env.open_db("confirmation_height".encode())                
-
+        error_count = 0
         count = 0
         with env.begin() as txn:
             cursor = txn.cursor(accounts_db)
@@ -167,74 +167,81 @@ try:
             mem_cache = []
             tmp = []
             for key, value in cursor:
-                keystream = KaitaiStream(io.BytesIO(key))
-                valstream = KaitaiStream(io.BytesIO(value))
+                try:
+                    keystream = KaitaiStream(io.BytesIO(key))
+                    valstream = KaitaiStream(io.BytesIO(value))
 
-                account_key = Nanodb.AccountsKey(keystream)
-                account_info = Nanodb.AccountsValue(valstream)
+                    account_key = Nanodb.AccountsKey(keystream)
+                    account_info = Nanodb.AccountsValue(valstream)
 
-                balance = nanolib.blocks.parse_hex_balance(
-                    account_info.balance.hex().upper()
-                )
+                    balance = nanolib.blocks.parse_hex_balance(
+                        account_info.balance.hex().upper()
+                    )
+                    
 
+                    confirmation_value = txn.get(
+                        account_key.account, default=None, db=confirmation_db
+                    )
+                    confirmation_valstream = KaitaiStream(io.BytesIO(confirmation_value))
+                    height_info = Nanodb.ConfirmationHeightValue(
+                        confirmation_valstream, None, Nanodb(None)
+                    )
+
+                    data_account = (
+                        # account
+                        nanolib.accounts.get_account_id(
+                            prefix=nanolib.AccountIDPrefix.NANO,
+                            public_key=account_key.account.hex(),
+                        ),
+                        # frontier
+                        account_info.head.hex().upper(),
+                        # open_block
+                        account_info.open_block.hex().upper(),
+                        # representative_block
+                        None,
+                        # balance
+                        balance,
+                        # #modified_timestamp
+                        datetime.datetime.utcfromtimestamp(account_info.modified).strftime(
+                            "%s"
+                        ),
+                        # #block_count
+                        account_info.block_count,
+                        # #confirmation_height
+                        height_info.height,
+                        # #confirmation_height_frontier
+                        height_info.frontier.hex().upper(),
+                    )
+                    
+                    tmp.append(data_account)
+                except Exception as ex:
+                    print(ex) 
+                    error_count += 1
                 print(
-                    "count: {}, account {}".format(
-                        count, account_key.account.hex().upper()
-                    ),
-                    end="\r",
-                )
-
-                confirmation_value = txn.get(
-                    account_key.account, default=None, db=confirmation_db
-                )
-                confirmation_valstream = KaitaiStream(io.BytesIO(confirmation_value))
-                height_info = Nanodb.ConfirmationHeightValue(
-                    confirmation_valstream, None, Nanodb(None)
-                )
-
-                data_account = (
-                    # account
-                    nanolib.accounts.get_account_id(
-                        prefix=nanolib.AccountIDPrefix.NANO,
-                        public_key=account_key.account.hex(),
-                    ),
-                    # frontier
-                    account_info.head.hex().upper(),
-                    # open_block
-                    account_info.open_block.hex().upper(),
-                    # representative_block
-                    None,
-                    # balance
-                    balance,
-                    # #modified_timestamp
-                    datetime.datetime.utcfromtimestamp(account_info.modified).strftime(
-                        "%s"
-                    ),
-                    # #block_count
-                    account_info.block_count,
-                    # #confirmation_height
-                    height_info.height,
-                    # #confirmation_height_frontier
-                    height_info.frontier.hex().upper(),
-                )
-                
-                tmp.append(data_account) 
+                        "count: {}, account {}".format(
+                            count, account_key.account.hex().upper()
+                        ),
+                        end="\r",
+                    )
                 count += 1                                               
                 
               
                 if count >= args.count:
-                    #add the last batch of accounts to mysql
-                    mem_cache.append(tmp)
-                    Parallel(n_jobs=num_cores)(delayed(processAccounts)(data_accounts) for data_accounts in mem_cache)
                     break
                 if count % 10000 == 0:                 
                     mem_cache.append(tmp)
                     tmp = []
                 if count % 500000 == 0:
+                    print("Process batch")
                     Parallel(n_jobs=num_cores)(delayed(processAccounts)(data_accounts) for data_accounts in mem_cache)
-                    mem_cache = []
+                    mem_cache = []            
             
             cursor.close()
+            #add the last batch of accounts to mysql                   
+            mem_cache.append(tmp)
+            Parallel(n_jobs=num_cores)(delayed(processAccounts)(data_accounts) for data_accounts in mem_cache)
+            print("exported: [{}] with [{}] error(s), last mysql batch size: [{}]".format(count, error_count, sum(len(x) for x in mem_cache)))
+            
         if count == 0:
             print("(empty)\n") 
                        
@@ -249,184 +256,189 @@ try:
         blocks_db = env.open_db("blocks".encode())
         confirmation_db = env.open_db("confirmation_height".encode())
 
-        with env.begin() as txn:            
+        with env.begin() as txn:
             cursor = txn.cursor(blocks_db)
             if args.key:
                 cursor.set_key(bytearray.fromhex(args.key))
 
             count = 0
-            mem_cache2 = [] 
+            mem_cache = [] 
             tmp = []
             for key, value in cursor:
-                keystream = KaitaiStream(io.BytesIO(key))
-                valstream = KaitaiStream(io.BytesIO(value))
-
                 try:
-                    block_key = Nanodb.BlocksKey(keystream)
-                    block = Nanodb.BlocksValue(valstream, None, Nanodb(None))
-                except Exception as ex:
-                    print(ex)
-                    continue
+                    keystream = KaitaiStream(io.BytesIO(key))
+                    valstream = KaitaiStream(io.BytesIO(value))
 
-                print(
-                    "count: {}, hash {}".format(count, block_key.hash.hex().upper()),
-                    end="\r",
-                )
+                    try:
+                        block_key = Nanodb.BlocksKey(keystream)
+                        block = Nanodb.BlocksValue(valstream, None, Nanodb(None))
+                    except Exception as ex:
+                        print(ex)
+                        continue
 
-                btype = block.block_type
-
-                if btype == Nanodb.EnumBlocktype.change:
-                    data_block = get_legacy_block(block.block_value)
-                    data_block["type"] = "5"
-                elif btype == Nanodb.EnumBlocktype.send:
-                    data_block = get_legacy_block(block.block_value)
-                    data_block["type"] = "4"
-                elif btype == Nanodb.EnumBlocktype.receive:
-                    data_block = get_legacy_block(block.block_value)
-                    data_block["type"] = "3"
-                elif btype == Nanodb.EnumBlocktype.state:
-                    data_block = get_state_block(block.block_value)
-                    data_block["type"] = "1"
-                elif btype == Nanodb.EnumBlocktype.open:
-                    data_block = get_legacy_block(block.block_value)
-                    data_block["type"] = "2"
-
-                data_block["hash"] = block_key.hash.hex().upper()
-                if (
-                    btype == Nanodb.EnumBlocktype.state
-                    or btype == Nanodb.EnumBlocktype.send
-                ):
-                    balance = nanolib.blocks.parse_hex_balance(
-                        block.block_value.block.balance.hex().upper()
-                    )
-                else:
-                    balance = nanolib.blocks.parse_hex_balance(
-                        block.block_value.sideband.balance.hex().upper()
+                    print(
+                        "count: {}, hash {}".format(count, block_key.hash.hex().upper()),
+                        end="\r",
                     )
 
-                data_block["balance"] = balance
-                data_block["confirmed"] = "1"
-                if (
-                    btype == Nanodb.EnumBlocktype.send
-                    or btype == Nanodb.EnumBlocktype.receive
-                    or btype == Nanodb.EnumBlocktype.change
-                ):
-                    account = block.block_value.sideband.account
-                else:
-                    account = block.block_value.block.account
+                    btype = block.block_type
 
-                data_block["account"] = nanolib.accounts.get_account_id(
-                    prefix=nanolib.AccountIDPrefix.NANO, public_key=account.hex()
-                )
+                    if btype == Nanodb.EnumBlocktype.change:
+                        data_block = get_legacy_block(block.block_value)
+                        data_block["type"] = "5"
+                    elif btype == Nanodb.EnumBlocktype.send:
+                        data_block = get_legacy_block(block.block_value)
+                        data_block["type"] = "4"
+                    elif btype == Nanodb.EnumBlocktype.receive:
+                        data_block = get_legacy_block(block.block_value)
+                        data_block["type"] = "3"
+                    elif btype == Nanodb.EnumBlocktype.state:
+                        data_block = get_state_block(block.block_value)
+                        data_block["type"] = "1"
+                    elif btype == Nanodb.EnumBlocktype.open:
+                        data_block = get_legacy_block(block.block_value)
+                        data_block["type"] = "2"
 
-                if btype == Nanodb.EnumBlocktype.open:
-                    data_block[
-                        "previous"
-                    ] = "0000000000000000000000000000000000000000000000000000000000000000"
-                else:
-                    data_block[
-                        "previous"
-                    ] = block.block_value.block.previous.hex().upper()
-
-                if (
-                    btype == Nanodb.EnumBlocktype.receive
-                    or btype == Nanodb.EnumBlocktype.send
-                ):
-                    data_block["representative"] = None
-                else:
-                    data_block["representative"] = nanolib.accounts.get_account_id(
-                        prefix=nanolib.AccountIDPrefix.NANO,
-                        public_key=block.block_value.block.representative.hex(),
-                    )
-
-                if btype == Nanodb.EnumBlocktype.state:
-                    data_block["link"] = block.block_value.block.link.hex().upper()
-                    data_block["link_as_account"] = nanolib.accounts.get_account_id(
-                        prefix=nanolib.AccountIDPrefix.NANO,
-                        public_key=block.block_value.block.link.hex(),
-                    )
-                elif btype == Nanodb.EnumBlocktype.send:
-                    data_block[
-                        "link"
-                    ] = block.block_value.block.destination.hex().upper()
-                    data_block["link_as_account"] = nanolib.accounts.get_account_id(
-                        prefix=nanolib.AccountIDPrefix.NANO,
-                        public_key=block.block_value.block.destination.hex(),
-                    )
-                elif btype == Nanodb.EnumBlocktype.receive:
-                    data_block["link"] = block.block_value.block.source.hex().upper()
-                    data_block["link_as_account"] = None
-                    # TODO - use source has to get account
-                else:
-                    data_block["link"] = None
-                    data_block["link_as_account"] = None
-
-                data_block[
-                    "signature"
-                ] = block.block_value.block.signature.hex().upper()
-                data_block["work"] = hex(block.block_value.block.work)[2:]
-
-                try:
-                    confirmation_value = txn.get(
-                        account, default=None, db=confirmation_db
-                    )
-                    confirmation_valstream = KaitaiStream(
-                        io.BytesIO(confirmation_value)
-                    )
-                    height_info = Nanodb.ConfirmationHeightValue(
-                        confirmation_valstream, None, Nanodb(None)
-                    )
-                    height = height_info.height
-                except Exception as ex:
-                    print(ex)
-                    height = 0
-
-                if data_block["height"] > 1:                    
-                    previous = txn.get(
-                        block.block_value.block.previous, default=None, db=blocks_db
-                    )
-                    previous_valstream = KaitaiStream(io.BytesIO(previous))
-                    previous_block = Nanodb.BlocksValue(
-                        previous_valstream, None, Nanodb(None)
-                    )
-                    ptype = previous_block.block_type
+                    data_block["hash"] = block_key.hash.hex().upper()
                     if (
-                        ptype == Nanodb.EnumBlocktype.state
-                        or ptype == Nanodb.EnumBlocktype.send
+                        btype == Nanodb.EnumBlocktype.state
+                        or btype == Nanodb.EnumBlocktype.send
                     ):
-                        previous_balance = nanolib.blocks.parse_hex_balance(
-                            previous_block.block_value.block.balance.hex().upper()
+                        balance = nanolib.blocks.parse_hex_balance(
+                            block.block_value.block.balance.hex().upper()
                         )
                     else:
-                        previous_balance = nanolib.blocks.parse_hex_balance(
-                            previous_block.block_value.sideband.balance.hex().upper()
+                        balance = nanolib.blocks.parse_hex_balance(
+                            block.block_value.sideband.balance.hex().upper()
                         )
 
-                    data_block["amount"] = str(
-                        abs(int(previous_balance) - int(balance))
-                    )
-                else:
-                    data_block["amount"] = balance
+                    data_block["balance"] = balance
+                    data_block["confirmed"] = "1"
+                    if (
+                        btype == Nanodb.EnumBlocktype.send
+                        or btype == Nanodb.EnumBlocktype.receive
+                        or btype == Nanodb.EnumBlocktype.change
+                    ):
+                        account = block.block_value.sideband.account
+                    else:
+                        account = block.block_value.block.account
 
-                data_block["confirmed"] = "1" if height >= data_block["height"] else "0"
-                                
-                tmp.append(data_block) 
+                    data_block["account"] = nanolib.accounts.get_account_id(
+                        prefix=nanolib.AccountIDPrefix.NANO, public_key=account.hex()
+                    )
+
+                    if btype == Nanodb.EnumBlocktype.open:
+                        data_block[
+                            "previous"
+                        ] = "0000000000000000000000000000000000000000000000000000000000000000"
+                    else:
+                        data_block[
+                            "previous"
+                        ] = block.block_value.block.previous.hex().upper()
+
+                    if (
+                        btype == Nanodb.EnumBlocktype.receive
+                        or btype == Nanodb.EnumBlocktype.send
+                    ):
+                        data_block["representative"] = None
+                    else:
+                        data_block["representative"] = nanolib.accounts.get_account_id(
+                            prefix=nanolib.AccountIDPrefix.NANO,
+                            public_key=block.block_value.block.representative.hex(),
+                        )
+
+                    if btype == Nanodb.EnumBlocktype.state:
+                        data_block["link"] = block.block_value.block.link.hex().upper()
+                        data_block["link_as_account"] = nanolib.accounts.get_account_id(
+                            prefix=nanolib.AccountIDPrefix.NANO,
+                            public_key=block.block_value.block.link.hex(),
+                        )
+                    elif btype == Nanodb.EnumBlocktype.send:
+                        data_block[
+                            "link"
+                        ] = block.block_value.block.destination.hex().upper()
+                        data_block["link_as_account"] = nanolib.accounts.get_account_id(
+                            prefix=nanolib.AccountIDPrefix.NANO,
+                            public_key=block.block_value.block.destination.hex(),
+                        )
+                    elif btype == Nanodb.EnumBlocktype.receive:
+                        data_block["link"] = block.block_value.block.source.hex().upper()
+                        data_block["link_as_account"] = None
+                        # TODO - use source has to get account
+                    else:
+                        data_block["link"] = None
+                        data_block["link_as_account"] = None
+
+                    data_block[
+                        "signature"
+                    ] = block.block_value.block.signature.hex().upper()
+                    data_block["work"] = hex(block.block_value.block.work)[2:]
+
+                    try:
+                        confirmation_value = txn.get(
+                            account, default=None, db=confirmation_db
+                        )
+                        confirmation_valstream = KaitaiStream(
+                            io.BytesIO(confirmation_value)
+                        )
+                        height_info = Nanodb.ConfirmationHeightValue(
+                            confirmation_valstream, None, Nanodb(None)
+                        )
+                        height = height_info.height
+                    except Exception as ex:
+                        print(ex)
+                        height = 0
+
+                    if data_block["height"] > 1:                    
+                        previous = txn.get(
+                            block.block_value.block.previous, default=None, db=blocks_db
+                        )
+                        previous_valstream = KaitaiStream(io.BytesIO(previous))
+                        previous_block = Nanodb.BlocksValue(
+                            previous_valstream, None, Nanodb(None)
+                        )
+                        ptype = previous_block.block_type
+                        if (
+                            ptype == Nanodb.EnumBlocktype.state
+                            or ptype == Nanodb.EnumBlocktype.send
+                        ):
+                            previous_balance = nanolib.blocks.parse_hex_balance(
+                                previous_block.block_value.block.balance.hex().upper()
+                            )
+                        else:
+                            previous_balance = nanolib.blocks.parse_hex_balance(
+                                previous_block.block_value.sideband.balance.hex().upper()
+                            )
+
+                        data_block["amount"] = str(
+                            abs(int(previous_balance) - int(balance))
+                        )
+                    else:
+                        data_block["amount"] = balance
+
+                    data_block["confirmed"] = "1" if height >= data_block["height"] else "0"
+                                    
+                    tmp.append(data_block)
+                except Exception as ex:
+                    print(ex)
+               
                 count += 1                                               
                 
-                if count >= args.count:
-                    mem_cache2.append(tmp)
-                    Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache2)
+                if count >= args.count:                    
                     break
                 if count % 10000 == 0:                 
-                    mem_cache2.append(tmp)
+                    mem_cache.append(tmp)
                     tmp = []
                 if count % 500000 == 0:
-                    Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache2)
-                    mem_cache2 = []
-               
+                    Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache)
+                    mem_cache = []
                     
-                       
+                                           
             cursor.close()
+            mem_cache.append(tmp)
+            Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache)
+            print("exported: [{}] with [{}] error(s), last mysql batch size: [{}]".format(count, error_count, sum(len(x) for x in mem_cache)))
+            
         if count == 0:
             print("(empty)\n")
 
