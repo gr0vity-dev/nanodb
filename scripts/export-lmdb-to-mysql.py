@@ -19,7 +19,8 @@ with open("config.json") as json_data_file:
     config = json.load(json_data_file)
     
 mysql_config = config["mysql"]["connection"]
-    
+
+
 add_block = (
     "INSERT INTO blocks "
     "(hash, amount, balance, height, local_timestamp, confirmed,"
@@ -149,7 +150,7 @@ try:
     if not os.path.isfile(filename):
         raise Exception("Database doesn't exist")
 
-    env = lmdb.open(filename, subdir=False, readonly=True, lock=False, max_dbs=100) 
+    env = lmdb.open(filename, subdir=False, max_dbs=100, map_size=80000000000 )#10GB 
     num_cores = multiprocessing.cpu_count()     
 
     # Accounts table
