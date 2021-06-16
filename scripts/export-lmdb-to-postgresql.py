@@ -177,7 +177,7 @@ try:
                 cursor.set_key(bytearray.fromhex(args.key))               
             mem_cache = []
             tmp = []
-            print(args.count)
+            
             for key, value in cursor:
                 try:
                     keystream = KaitaiStream(io.BytesIO(key))
@@ -231,7 +231,7 @@ try:
                     print(ex)   
                     error_count += 1 
                 print(
-                        "count: {}, account ".format(
+                        "count: {} acocunts ".format(
                             count#, account_key.account.hex().upper()
                         ),
                         end="\r",
@@ -273,6 +273,7 @@ try:
                 cursor.set_key(bytearray.fromhex(args.key))
 
             count = 0
+            error_count = 0
             mem_cache = [] 
             tmp = []
             for key, value in cursor:
@@ -286,12 +287,7 @@ try:
                     except Exception as ex:
                         print(ex)
                         continue
-
-                    print(
-                        "count: {}, hash {}".format(count, block_key.hash.hex().upper()),
-                        end="\r",
-                    )
-
+                    
                     btype = block.block_type
 
                     if btype == Nanodb.EnumBlocktype.change:
@@ -429,11 +425,16 @@ try:
 
                     data_block["confirmed"] = "1" if height >= data_block["height"] else "0"
                                     
-                    tmp.append(data_block) 
-                    count += 1  
+                    tmp.append(data_block)                      
                 except Exception as ex:
-                    print(ex)                    
+                    print(ex)
+                    error_count += 1
+                print(
+                        "count: {} hashes".format(count#, block_key.hash.hex().upper()),
+                        ),end="\r",
+                    )
                 
+                count += 1  
                 if count >= args.count:                    
                     break
                 if count % 10000 == 0:                 
