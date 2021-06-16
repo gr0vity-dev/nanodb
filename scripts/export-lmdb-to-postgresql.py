@@ -24,7 +24,7 @@ blocks_disable_index = ("UPDATE pg_index SET indisready=false WHERE indrelid = (
 blocks_enable_index = ("UPDATE pg_index SET indisready=true WHERE indrelid = (SELECT oid FROM pg_class WHERE relname='blocks'); REINDEX TABLE blocks ;")
 
 accounts_disable_index = ("UPDATE pg_index SET indisready=false WHERE indrelid = (SELECT oid FROM pg_class WHERE relname='accounts'); ")
-accounts_enable_index = ("UPDATE pg_index SET indisready=true WHERE indrelid = (SELECT oid FROM pg_class WHERE relname='accounts'); REINDEX accounts ;")
+accounts_enable_index = ("UPDATE pg_index SET indisready=true WHERE indrelid = (SELECT oid FROM pg_class WHERE relname='accounts'); REINDEX TABLE accounts ;")
     
     
 add_block = (
@@ -159,8 +159,9 @@ try:
     if not os.path.isfile(filename):
         raise Exception("Database doesn't exist")
 
-    env = lmdb.open(filename, subdir=False, readonly=True, lock=False, max_dbs=100, map_size=80000000000 )#10GB 
+    env = lmdb.open(filename, subdir=False, readonly=True, lock=False, max_dbs=100 )
     num_cores = multiprocessing.cpu_count()     
+    print("Disable Indexes for faster inserts")
     disableIndex()
     
     # Accounts table
@@ -168,7 +169,7 @@ try:
         print("Importing Accounts")
         accounts_db = env.open_db("accounts".encode())
         confirmation_db = env.open_db("confirmation_height".encode())                
-
+        error_count = 0
         count = 0
         with env.begin() as txn:
             cursor = txn.cursor(accounts_db)
@@ -176,6 +177,7 @@ try:
                 cursor.set_key(bytearray.fromhex(args.key))               
             mem_cache = []
             tmp = []
+            print(args.count)
             for key, value in cursor:
                 try:
                     keystream = KaitaiStream(io.BytesIO(key))
@@ -188,12 +190,7 @@ try:
                         account_info.balance.hex().upper()
                     )
 
-                    print(
-                        "count: {}, account {}".format(
-                            count, account_key.account.hex().upper()
-                        ),
-                        end="\r",
-                    )
+                    
 
                     confirmation_value = txn.get(
                         account_key.account, default=None, db=confirmation_db
@@ -229,29 +226,38 @@ try:
                         height_info.frontier.hex().upper(),
                     )
                     
-                    tmp.append(data_account) 
-                    count += 1    
+                    tmp.append(data_account)                     
                 except Exception as ex:
-                    print(ex)                    
-                
+                    print(ex)   
+                    error_count += 1 
+                print(
+                        "count: {}, account ".format(
+                            count#, account_key.account.hex().upper()
+                        ),
+                        end="\r",
+                    )
+                count += 1    
               
-                if count >= args.count:
-                    #add the last batch of accounts to mysql
-                    mem_cache.append(tmp)
-                    Parallel(n_jobs=num_cores)(delayed(processAccounts)(data_accounts) for data_accounts in mem_cache)
-                    print("mem_cache : [{}]  / count : [{}]".format(len(mem_cache),count))
+                if count >= args.count:                                      
                     break
                 if count % 10000 == 0:                 
                     mem_cache.append(tmp)
                     tmp = []
                 if count % 500000 == 0:
                     Parallel(n_jobs=num_cores)(delayed(processAccounts)(data_accounts) for data_accounts in mem_cache)
-                    mem_cache = []
-            
+                    mem_cache = []            
             cursor.close()
+            
+            #add the last batch of accounts to mysql  
+            mem_cache.append(tmp)
+            Parallel(n_jobs=num_cores)(delayed(processAccounts)(data_accounts) for data_accounts in mem_cache)
+            print("exported: [{}] with [{}] error(s), last mysql batch size: [{}]".format(count, error_count, sum(len(x) for x in mem_cache)))
+
         if count == 0:
             print("(empty)\n") 
-
+            
+        
+        
 
     # blocks table
     if args.table == "all" or args.table == "blocks":
@@ -267,7 +273,7 @@ try:
                 cursor.set_key(bytearray.fromhex(args.key))
 
             count = 0
-            mem_cache2 = [] 
+            mem_cache = [] 
             tmp = []
             for key, value in cursor:
                 try:
@@ -428,24 +434,26 @@ try:
                 except Exception as ex:
                     print(ex)                    
                 
-                if count >= args.count:
-                    mem_cache2.append(tmp)
-                    Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache2)
+                if count >= args.count:                    
                     break
                 if count % 10000 == 0:                 
-                    mem_cache2.append(tmp)
+                    mem_cache.append(tmp)
                     tmp = []
                 if count % 500000 == 0:
-                    Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache2)
-                    mem_cache2 = []
-               
+                    Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache)
+                    mem_cache = []              
                     
-                       
+                      
             cursor.close()
+            mem_cache.append(tmp)
+            Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache)
+            print("exported: [{}] with [{}] error(s), last mysql batch size: [{}]".format(count, error_count, sum(len(x) for x in mem_cache)))
+            
         if count == 0:
             print("(empty)\n")
 
     env.close()
+    print("Re-Enable Indexes")
     enableIndex()
     
     # cnx.close()
