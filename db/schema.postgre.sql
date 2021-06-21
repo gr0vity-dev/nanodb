@@ -48,6 +48,7 @@ CREATE TABLE blocks (
 );
 
 CREATE INDEX blocks_account ON blocks USING btree(account);
+CREATE INDEX blocks_link ON blocks USING btree(link);
 CREATE INDEX blocks_type ON blocks USING btree(type);
 CREATE INDEX blocks_subtype ON blocks USING btree(subtype);
 CREATE INDEX blocks_amount ON blocks USING btree(amount);
