@@ -36,8 +36,8 @@ add_block = (
     "%(representative)s, %(link)s, %(link_as_account)s, %(signature)s, %(work)s,"
     "%(subtype)s)"
     "ON CONFLICT (hash) DO UPDATE SET amount=excluded.amount, balance=excluded.balance, height=excluded.height,"
-     "account=excluded.account, previous=excluded.previous, representative=excluded.representative, link=excluded.link,"
-     "link_as_account=excluded.link_as_account, signature=excluded.signature, work=excluded.work, subtype=excluded.subtype"
+    "account=excluded.account, previous=excluded.previous, representative=excluded.representative, link=excluded.link,"
+    "link_as_account=excluded.link_as_account, signature=excluded.signature, work=excluded.work, subtype=excluded.subtype"
  )
 
 add_account = (
@@ -96,30 +96,22 @@ def enableIndex():
     postgresql_cursor.execute(accounts_enable_index) 
     
 def processAccounts(data_in):
-    # export_counter = 0
     conn = psycopg2.connect("host={} port={} dbname={} user={} password={}".format(postgresql_config["host"],postgresql_config["port"],postgresql_config["dbname"],postgresql_config["user"],postgresql_config["password"]))
     conn.set_session(autocommit=False)
     postgresql_cursor = conn.cursor()  
-    # postgresql_cursor.execute("SET foreign_key_checks = 0")
-    # postgresql_cursor.execute("SET unique_checks = 0")  
     for data_account in data_in:   
         postgresql_cursor.execute(add_account, data_account) 
-        # export_counter += 1
-        #print("import_count : [{}]".format(export_counter))
+        print(".",end="")
     conn.commit()        
     conn.close()
 
 def processBlocks(data_in):
-    #export_counter = 0
     conn = psycopg2.connect("host={} port={} dbname={} user={} password={}".format(postgresql_config["host"],postgresql_config["port"],postgresql_config["dbname"],postgresql_config["user"],postgresql_config["password"]))
     conn.set_session(autocommit=False)
-    postgresql_cursor = conn.cursor() 
-    #postgresql_cursor.execute("SET foreign_key_checks = 0")
-    #postgresql_cursor.execute("SET unique_checks = 0")   
+    postgresql_cursor = conn.cursor()   
     for data_blocks in data_in:   
         postgresql_cursor.execute(add_block, data_blocks) 
-        #export_counter += 1
-        #print("import_count : [{}]".format(export_counter))
+        print(".",end="")
     conn.commit()        
     conn.close()  
 
@@ -148,8 +140,30 @@ parser.add_argument(
     type=str,
     help="Start iterating at this exact key. This must be a byte array in hex representation.",
 )
+parser.add_argument(
+    "--disable_index",
+    type=str,
+    help="If true, disable/reenable indexes before/after inserts. Default = false",
+)
+parser.add_argument(
+    "--cache_prev",
+    type=str,
+    help="If true, add the balance of every newly seen hsh into a dict to speed up the process. !!Uses a lot of memory. Default = false" ,
+)
+parser.add_argument(
+    "--get_conf",
+    type=str,
+    help="If false, do not get the confirmation value from confirmation_db, instead always set to 1. Speeds up export. Default = true" ,
+)
 args = parser.parse_args()
 
+
+if args.disable_index == None:
+  args.disable_index = "FALSE"
+if args.cache_prev == None:
+  args.cache_prev = "FALSE"
+if args.get_conf == None:
+  args.get_conf = "TRUE"
 
 try:
     # Override database filename
@@ -159,10 +173,13 @@ try:
     if not os.path.isfile(filename):
         raise Exception("Database doesn't exist")
 
-    env = lmdb.open(filename, subdir=False, readonly=True, lock=False, max_dbs=100 )
+    env = lmdb.open(filename, subdir=False, max_dbs=100, map_size=10485760 )
     num_cores = multiprocessing.cpu_count()     
-    print("Disable Indexes for faster inserts")
-    disableIndex()
+    
+    
+    if args.disable_index.upper() == "TRUE":
+      print("Disable Indexes for faster inserts")
+      disableIndex()
     
     # Accounts table
     if args.table == "all" or args.table == "accounts":
@@ -268,12 +285,18 @@ try:
         confirmation_db = env.open_db("confirmation_height".encode())
 
         with env.begin() as txn:        
-            cursor = txn.cursor(blocks_db)
+            cursor = txn.cursor(blocks_db)            
             if args.key:
                 cursor.set_key(bytearray.fromhex(args.key))
-
+            count = 0                     
+            dict_previous_balance = {}
+           
+            cursor = txn.cursor(blocks_db) 
             count = 0
             error_count = 0
+            balance_from_memory = 0  
+            balance_from_lmdb = 0
+            balance_insert_count = 0
             mem_cache = [] 
             tmp = []
             for key, value in cursor:
@@ -285,8 +308,8 @@ try:
                         block_key = Nanodb.BlocksKey(keystream)
                         block = Nanodb.BlocksValue(valstream, None, Nanodb(None))
                     except Exception as ex:
-                        print(ex)
-                        continue
+                        print("Ex1: {}".format(ex))
+                        continue                       
                     
                     btype = block.block_type
 
@@ -320,7 +343,7 @@ try:
                         )
 
                     data_block["balance"] = balance
-                    data_block["confirmed"] = "1"
+                    data_block["confirmed"] = "1"    
                     if (
                         btype == Nanodb.EnumBlocktype.send
                         or btype == Nanodb.EnumBlocktype.receive
@@ -372,6 +395,10 @@ try:
                         data_block["link"] = block.block_value.block.source.hex().upper()
                         data_block["link_as_account"] = None
                         # TODO - use source has to get account
+                    elif btype == Nanodb.EnumBlocktype.open:
+                        data_block["link"] = block.block_value.block.source.hex().upper()
+                        data_block["link_as_account"] = None
+                        # TODO - use source has to get account
                     else:
                         data_block["link"] = None
                         data_block["link_as_account"] = None
@@ -381,58 +408,74 @@ try:
                     ] = block.block_value.block.signature.hex().upper()
                     data_block["work"] = hex(block.block_value.block.work)[2:]
 
-                    try:
-                        confirmation_value = txn.get(
-                            account, default=None, db=confirmation_db
-                        )
-                        confirmation_valstream = KaitaiStream(
-                            io.BytesIO(confirmation_value)
-                        )
-                        height_info = Nanodb.ConfirmationHeightValue(
-                            confirmation_valstream, None, Nanodb(None)
-                        )
-                        height = height_info.height
-                    except Exception as ex:
-                        print(ex)
-                        height = 0
+                    if args.get_conf.upper() == "TRUE":
+                        try:
+                            confirmation_value = txn.get(
+                                account, default=None, db=confirmation_db
+                            )
+                            confirmation_valstream = KaitaiStream(
+                                io.BytesIO(confirmation_value)
+                            )
+                            height_info = Nanodb.ConfirmationHeightValue(
+                                confirmation_valstream, None, Nanodb(None)
+                            )
+                            height = height_info.height
+                        except Exception as ex:
+                            print(ex)
+                            height = 0
+                        data_block["confirmed"] = "1" if height >= data_block["height"] else "0"
 
-                    if data_block["height"] > 1:                    
-                        previous = txn.get(
+                    if data_block["height"] > 1:
+                        if args.cache_prev.upper() == "TRUE":  
+                          #add to memory
+                          dict_previous_balance[data_block["hash"]] = data_block["balance"]                            
+                        #if hash of data_block["previous"] has been seen previously, grab from memory instead of querying lmdb                      
+                        if data_block["previous"] in dict_previous_balance :
+                            data_block["amount"] = str(
+                                abs(int(dict_previous_balance[data_block["previous"]]) - int(balance))
+                            )                            
+                            del dict_previous_balance[data_block["previous"]]
+                            balance_from_memory += 1                          
+                            
+                        else :
+                            
+                            previous = txn.get(
                             block.block_value.block.previous, default=None, db=blocks_db
-                        )
-                        previous_valstream = KaitaiStream(io.BytesIO(previous))
-                        previous_block = Nanodb.BlocksValue(
-                            previous_valstream, None, Nanodb(None)
-                        )
-                        ptype = previous_block.block_type
-                        if (
-                            ptype == Nanodb.EnumBlocktype.state
-                            or ptype == Nanodb.EnumBlocktype.send
-                        ):
-                            previous_balance = nanolib.blocks.parse_hex_balance(
-                                previous_block.block_value.block.balance.hex().upper()
                             )
-                        else:
-                            previous_balance = nanolib.blocks.parse_hex_balance(
-                                previous_block.block_value.sideband.balance.hex().upper()
+                            previous_valstream = KaitaiStream(io.BytesIO(previous))
+                            previous_block = Nanodb.BlocksValue(
+                                previous_valstream, None, Nanodb(None)
                             )
-
-                        data_block["amount"] = str(
-                            abs(int(previous_balance) - int(balance))
-                        )
+                            ptype = previous_block.block_type
+                            if (
+                                ptype == Nanodb.EnumBlocktype.state
+                                or ptype == Nanodb.EnumBlocktype.send
+                            ):
+                                previous_balance = nanolib.blocks.parse_hex_balance(
+                                    previous_block.block_value.block.balance.hex().upper()
+                                )
+                            else:
+                                previous_balance = nanolib.blocks.parse_hex_balance(
+                                    previous_block.block_value.sideband.balance.hex().upper()
+                                )
+                            data_block["amount"] = str(
+                                abs(int(previous_balance) - int(balance))
+                            )      
+                            balance_from_lmdb += 1                            
                     else:
                         data_block["amount"] = balance
+                        balance_insert_count += 1
 
-                    data_block["confirmed"] = "1" if height >= data_block["height"] else "0"
-                                    
+                    # data_block["confirmed"] = "1" if height >= data_block["height"] else "0"
                     tmp.append(data_block)                      
                 except Exception as ex:
-                    print(ex)
+                    print("Ex2: {}".format(ex))
                     error_count += 1
-                print(
-                        "count: {} hashes".format(count#, block_key.hash.hex().upper()),
-                        ),end="\r",
-                    )
+                if count % 10000 == 0 :
+                    print(
+                            "count:{} from_mem:{} from_lmdb:{} from_block:{} ".format(count,balance_from_memory,balance_from_lmdb,balance_insert_count,#, block_key.hash.hex().upper()),
+                            ),end="\r",
+                        )
                 
                 count += 1  
                 if count >= args.count:                    
@@ -441,21 +484,28 @@ try:
                     mem_cache.append(tmp)
                     tmp = []
                 if count % 500000 == 0:
+                    print(
+                            "import_count:{} from_mem:{} from_lmdb:{} from_block:{} dict_length:{}".format(count,balance_from_memory,balance_from_lmdb,balance_insert_count,len(dict_previous_balance),#, block_key.hash.hex().upper()),
+                            ),end="\r",
+                        )
                     Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache)
-                    mem_cache = []              
-                    
+                    mem_cache = []
+                                        
                       
             cursor.close()
             mem_cache.append(tmp)
             Parallel(n_jobs=num_cores)(delayed(processBlocks)(data_blocks) for data_blocks in mem_cache)
             print("exported: [{}] with [{}] error(s), last mysql batch size: [{}]".format(count, error_count, sum(len(x) for x in mem_cache)))
             
+            
         if count == 0:
             print("(empty)\n")
+        
 
     env.close()
-    print("Re-Enable Indexes")
-    enableIndex()
+    if args.disable_index.upper() == "TRUE":
+      print("Re-Enable Indexes")
+      enableIndex()
     
     # cnx.close()
 except Exception as ex:
